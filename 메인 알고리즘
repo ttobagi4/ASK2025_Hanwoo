@@ -1,0 +1,397 @@
+# 1. 이미지 전처리 : 노이즈 제거 -> 밝기, 대비, 선명도 조정 -> 배경 제거
+# 2. 근내지방도 계산
+# 3. 육질부/지방부 대표색 선정
+# 4. 보수력(조직감) 분석
+# 5. 육질등급 판정
+
+import cv2
+import numpy as np
+import os
+from sklearn.cluster import KMeans
+
+goal_brightness = 115.0
+goal_contrast = 70.0
+goal_sharpness = 280.0
+
+# cv2.imread의 이미지 형식은 BGR (RGB로 변환 필요)
+# image = cv2.imread('C://Users//apple//OneDrive//바탕 화면//사서 고생//IT Study//3. ASK2025 한우 신선도 판별//축산물 품질(QC) 이미지//1 _ (2).jpg')
+# image_RGB = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+# 폴더 경로 설정
+image_folder = "C://Desktop//IT Study//3. ASK2025 Beef Automation//QC images//2"
+output_folder = "C://Desktop//IT Study//3. ASK2025 Beef Automation//QC images//2 result"
+
+# 이미지 파일 목록 불러오기
+image_files = [f for f in os.listdir(image_folder) if f.endswith('.jpg') or f.endswith('.png')]
+
+# batch_size장씩 이미지 처리
+batch_size = 1
+
+for i in range(0, len(image_files), batch_size) :
+    batch = image_files[i:i+batch_size]  # batch_size장씩 묶음
+    
+    for image_file in batch :
+        image_path = os.path.join(image_folder, image_file)
+        
+        image = cv2.imread(image_path)
+        
+        if image is None :
+            print(f"Failed to load image: {image_path}")
+            continue  # 이미지 로딩 실패 시 건너뛰기
+        
+        # 색상 변환 (BGR -> RGB)
+        try:
+            image_RGB = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        except cv2.error as e :
+            print(f"Error converting image {image_path}: {e}")
+            continue
+
+        """
+        # 노이즈 제거 : 양방향 필터(Bilateral Filter) 기법
+        """
+        
+        # 양방향 필터 : 이미지 픽셀 간 색상과 거리의 유사성 기반으로 블러링 강도 조절 -> 가장자리 정보 보존
+        # 이미지의 세부적인 부분들 유지하며 노이즈 제거
+        # (image_RGB, 필터 직경, 색상 공간, 좌표 공간) => 양방향 필터의 주요 매개변수
+        # 필터 직경 = 본 필터가 처리하는 픽셀 영역의 크기
+        # Sigma 값(색상/좌표 공간) = 색상 차이와 공간적 거리를 고려하는 정보
+        image_RGB = cv2.bilateralFilter(image_RGB, 9, 40, 40)
+        
+        """
+        # 밝기(brightness) : 가중 평균
+        # R : 0.2126 / G : 0.7152 / B : 0.0722 (일반적으로 사용하는 가중치)`
+        """
+        
+        # RGB 채널 분리
+        R = image_RGB[:, :, 0]
+        G = image_RGB[:, :, 1]
+        B = image_RGB[:, :, 2]
+        
+        # 가중치 사용해서 밝기 계산
+        # average_brightness : 이미지 전체 밝기의 절댓값을 나타내는 스칼라 값 (0 ~ 255)
+        brightness = 0.2126*R + 0.7152*G + 0.0722*B
+        average_brightness = np.mean(brightness)
+        adjustment_ratio_brightness = goal_brightness / average_brightness # 비율 계산
+        
+        # goal_brightness에 맞게 밝기 조정
+        # np.clip : 값이 0 ~ 255 범위를 넘지 않도록 처리
+        R_adjusted_brightness = np.clip(R * adjustment_ratio_brightness, 0, 255).astype(np.uint8)
+        G_adjusted_brightness = np.clip(G * adjustment_ratio_brightness, 0, 255).astype(np.uint8)
+        B_adjusted_brightness = np.clip(B * adjustment_ratio_brightness, 0, 255).astype(np.uint8)
+        
+        # 조정된 채널들 합치기
+        image_adjusted_brightness = cv2.merge([R_adjusted_brightness, G_adjusted_brightness, B_adjusted_brightness])
+        
+        """
+        # 대비(contrast) : 밝기 분산(표준편차)
+        # 이미지에서 각 픽셀의 밝기값을 평균 밝기값과 비교한 값 측정 -> 차이를 확대 or 축소
+        """
+        
+        # 각 픽셀의 밝기가 평균 밝기에서 얼마나 벗어나 있는지(표준 편차) 계산
+        # 표준 편차 = 대비
+        brightness_adjusted = 0.2126 * R_adjusted_brightness + 0.7152 * G_adjusted_brightness + 0.0722 * B_adjusted_brightness
+        mean_brightness_adjusted = np.mean(brightness_adjusted)
+        contrast = np.sqrt(np.mean((brightness_adjusted - mean_brightness_adjusted) ** 2))
+        
+        # 대비 조정 비율 계산
+        if contrast != 0 :
+            contrast_ratio = goal_contrast / contrast
+        else:
+            contrast_ratio = 1 # 대비가 0인 경우 조정 불필요
+        
+        # 대비 조정
+        R_adjusted_contrast = np.clip(R_adjusted_brightness * contrast_ratio + mean_brightness_adjusted * (1 - contrast_ratio), 0, 255).astype(np.uint8)
+        G_adjusted_contrast = np.clip(G_adjusted_brightness * contrast_ratio + mean_brightness_adjusted * (1 - contrast_ratio), 0, 255).astype(np.uint8)
+        B_adjusted_contrast = np.clip(B_adjusted_brightness * contrast_ratio + mean_brightness_adjusted * (1 - contrast_ratio), 0, 255).astype(np.uint8)
+        
+        image_adjusted_contrast = cv2.merge([R_adjusted_contrast, G_adjusted_contrast, B_adjusted_contrast])
+        
+        """
+        # 선명도(sharpness) : 라플라시안 필터(선명도 측정) -> 언샤프 마스크 기법(선명도 높이기)
+        # 라플라시안 필터 : 2차 미분을 통해 더욱 정확한 엣지 정보 추출 가능
+        # 언샤프 마스크 : 원본과 블러 처리된 이미지를 결합해 선명도 높이기
+        """
+        
+        # RGB -> GRAY 변환
+        gray_image = cv2.cvtColor(image_adjusted_contrast, cv2.COLOR_RGB2GRAY)
+        
+        # cv2.Laplacian : 분산 계산, 선명도의 값으로 사용
+        laplacian = cv2.Laplacian(gray_image, cv2.CV_64F)
+        sharpness = np.var(laplacian)
+        
+        # 목표 선명도와 원래 선명도의 비율 구하기
+        if sharpness != 0 :
+            sharpness_ratio = goal_sharpness / sharpness
+        else:
+            sharpness_ratio = 1
+        
+        # 언샤프 마스크 : 이미지 블러 처리 -> 원본 이미지 + 블러 이미지 = 엣지 더 두드러지게
+        blurred = cv2.GaussianBlur(image_adjusted_contrast, (9, 9), 0)
+        sharpened = cv2.addWeighted(image_adjusted_contrast, 1 + sharpness_ratio, blurred, -sharpness_ratio, 0)
+        
+        laplacian_adjusted = cv2.Laplacian(cv2.cvtColor(sharpened, cv2.COLOR_RGB2GRAY), cv2.CV_64F)
+        adjusted_sharpness = np.var(laplacian_adjusted)
+        
+        # imshow 하기 위해 RGB -> BGR로 변환
+        image_adjusted_BGR = cv2.cvtColor(sharpened, cv2.COLOR_RGB2BGR)
+        
+        # print("원래 밝기 :", average_brightness)
+        # print("조정된 밝기 :", goal_brightness)
+        # print("원래 대비 :", contrast)
+        # print("조정된 대비 :", goal_contrast)
+        # print("원래 선명도 :", sharpness)
+        # print("조정된 선명도 :", adjusted_sharpness)
+        
+        """
+        # 외곽선 추출(배경 제거) : GrabCut 알고리즘
+        # 관심 영역(ROI) 사전 지정 -> 관심 영역 기반으로 배경과 전경 분리
+        """
+        
+        # 마스크, 배경 및 전경 모델 초기화 (GrabCut 알고리즘 작동을 위한 준비 단계)
+        mask = np.zeros(image_adjusted_BGR.shape[:2], np.uint8)
+        bgd_model = np.zeros((1, 65), np.float64)
+        fgd_model = np.zeros((1, 65), np.float64)
+        
+        # 관심 영역 사전 지정 (x, y, width, height)
+        rect = (50, 50, image_adjusted_BGR.shape[1]-100, image_adjusted_BGR.shape[0]-100)
+        
+        cv2.grabCut(image_adjusted_BGR, mask, rect, bgd_model, fgd_model, 5, cv2.GC_INIT_WITH_RECT)
+        
+        # 마스크 처리 (0, 2 = 배경 / 1, 3 = 전경을 의미)
+        # 배경 부분을 검은색(0)으로, 주인공을 원래의 색상으로 처리
+        mask2 = np.where((mask == 2) | (mask == 0), 0, 1).astype('uint8')  # 배경을 0, 전경을 1로 설정
+        background_0 = image_adjusted_BGR * mask2[:, :, np.newaxis]  # 원본 이미지와 마스크 곱하기
+        
+        """
+        # 근내지방도 산출 : Grayscale -> 이진화(Thresholding)
+        # 이진화 : 픽셀 값이 특정 임계값을 초과하면 흰색(255), 그렇지 않으면 검은색(0) 지정
+        """
+        
+        # 검은색(0, 0, 0)인 부분을 제외하는 마스크 생성 (배경 날리려고)
+        mask = np.all(background_0 != [0, 0, 0], axis=-1)
+        background_X = background_0.copy() # 깊은 복사 (업데이트 부분)
+        background_X[~mask] = [0,0,0] # 마스크가 아닌 영역을 0으로 지정함
+        
+        # 이미지가 BRG일 경우, 그레이스케일 변환 / 이미 그레이스케일이면 그대로 사용
+        if len(background_X.shape) == 3 and background_X.shape[2] == 3 :
+            gray = cv2.cvtColor(background_X, cv2.COLOR_BGR2GRAY)
+        else :
+            gray = background_X
+        
+        _, binary = cv2.threshold(gray, 165, 255, cv2.THRESH_BINARY)
+        binary = np.uint8(binary)
+        
+        total_pixels = np.sum(mask)
+        fat_pixels = np.sum(binary == 255)
+        
+        fat_ratio = fat_pixels / total_pixels * 100
+        
+        print("지방 함량 :", f"{fat_ratio:.1f} %")
+        
+        if fat_ratio >= 19.0 :
+            marbling = 9
+        elif fat_ratio >= 17.0 :
+            marbling = 8
+        elif fat_ratio >= 15.0 :
+            marbling = 7
+        elif fat_ratio >= 12.0 :
+            marbling = 6
+        elif fat_ratio >= 11.0 :
+            marbling = 5
+        elif fat_ratio >= 9.0 :
+            marbling = 4
+        elif fat_ratio >= 7.0 :
+            marbling = 3
+        elif fat_ratio >= 5.0 :
+            marbling = 2
+        elif fat_ratio >= 1.0 :
+            marbling = 1
+        elif fat_ratio < 0.9 :
+            marbling = 0
+            
+        if marbling >= 7.0 :
+            intramuscular_fat = "1++"
+        elif marbling >= 6.0 :
+            intramuscular_fat = "1+"
+        elif marbling >= 4.0 :
+            intramuscular_fat = "1"
+        elif marbling >= 2.0 :
+            intramuscular_fat = "2"
+        elif marbling >= 1.0 :
+            intramuscular_fat = "3"
+        
+        print ("근내지방도 :", marbling)
+        print ("등급 :", intramuscular_fat)
+        
+        """
+        # 육질부/지방부 대표색 선정
+        # K-means 클러스터링 (검은색 제외한 픽셀들을 2개의 클러스터로 나눈다.)
+        # 클러스터 중심 색상 : 밝은 색상(지방부) / 어두운 색상(육질부) 로 판단
+        """
+        
+        # RGB -> CIE Lab 변환
+        def rgb_to_lab(rgb_color) :
+            rgb_color = np.uint8([[rgb_color]])
+            lab_color = cv2.cvtColor(rgb_color, cv2.COLOR_RGB2Lab)[0][0]
+            return lab_color
+        
+        # ΔE 계산 함수 (CIE76)
+        def delta_e_cie76(lab1, lab2) :
+            return np.sqrt(np.sum((lab1 - lab2) ** 2))
+        
+        background_0 = cv2.cvtColor(background_0, cv2.COLOR_BGR2RGB)
+        
+        # 검은색 배경 마스크 생성
+        lower_black = np.array([0, 0, 0])  # 하한값
+        upper_black = np.array([10, 10, 10])  # 상한값
+        black_mask = cv2.inRange(background_0, lower_black, upper_black)
+        
+        # 검은색 배경 제외하기
+        black_X = cv2.bitwise_not(black_mask)
+        black_X_pixels = background_0[black_X > 0].reshape(-1, 3)
+        
+        # K-means 클러스터링
+        K_means = KMeans(n_clusters=2, random_state=42)
+        K_means.fit(black_X_pixels)
+        colors = K_means.cluster_centers_
+        
+        # 밝기 계산
+        brightness_1 = 0.299 * colors[0][0] + 0.587 * colors[0][1] + 0.114 * colors[0][2]
+        brightness_2 = 0.299 * colors[1][0] + 0.587 * colors[1][1] + 0.114 * colors[1][2]
+        
+        if brightness_1 > brightness_2 :
+            fat_color = colors[0]
+            meat_color = colors[1]
+        else:
+            fat_color = colors[1]
+            meat_color = colors[0]
+            
+        fat_color = np.clip(fat_color, 190, 255)
+        
+        # 기준 육질부 색상 (Lab)
+        meat_std_colors = [
+            (241, 99, 89),  # 1
+            (220, 87, 82),  # 2
+            (209, 73, 73),  # 3
+            (188, 59, 61),  # 4
+            (177, 52, 60),  # 5
+            (163, 54, 59),  # 6
+            (156, 56, 58)   # 7
+        ]
+        
+        # 기준 지방부 색상 (Lab)
+        fat_std_colors = [
+            (255, 254, 242),  # 1
+            (255, 248, 230),  # 2
+            (255, 240, 209),  # 3
+            (254, 231, 190),  # 4
+            (255, 223, 172),  # 5
+            (255, 216, 157),  # 6
+            (255, 207, 141)   # 7
+        ]
+        
+        # RGB -> Lab 변환
+        meat_color_lab = rgb_to_lab(meat_color)
+        fat_color_lab = rgb_to_lab(fat_color)
+        meat_std_colors_lab = [rgb_to_lab(color) for color in meat_std_colors]
+        fat_std_colors_lab = [rgb_to_lab(color) for color in fat_std_colors]
+        
+        # ΔE 계산 (육질부)
+        meat_distances = [delta_e_cie76(meat_color_lab, std_color_lab) for std_color_lab in meat_std_colors_lab]
+        
+        # ΔE 계산 (지방부)
+        fat_distances = [delta_e_cie76(fat_color_lab, std_color_lab) for std_color_lab in fat_std_colors_lab]
+        
+        # 가장 가까운 기준 색상의 인덱스
+        closest_meat_index = np.argmin(meat_distances) + 1
+        closest_fat_index = np.argmin(fat_distances) + 1
+        
+        # 육질부 판정
+        if 2 <= closest_meat_index <= 6 :
+            meat_result = f"Acceptable (Closest to {closest_meat_index})"
+        else :
+            meat_result = f"Unacceptable (Closest to {closest_meat_index})"
+        
+        # 지방부 판정
+        if 1 <= closest_fat_index <= 6 :
+            fat_result = f"Acceptable (Closest to {closest_fat_index})"
+        else :
+            fat_result = f"Unacceptable (Closest to {closest_fat_index})"
+        
+        print("육질부 판정 :", meat_result)
+        print("지방부 판정 :", fat_result)
+        
+        """
+        # 보수력(조직감) 판정 : HSV 분석
+        # H(색상), S(채도) 값의 평균 계산
+        # H 값 : 고기의 근육색(붉은색)과 지방색(흰색)의 분포 파악
+        # S 값 : 색이 얼마나 선명한지 표현, 고기의 신선도 평가의 시각적 지표
+        # 육즙이 풍부하고 신선한 고기 = 낮은 H값 + 높은 S값 (붉은 근육색 유지)
+        """
+        
+        # black_X_pixels는 RGB이므로 우선 전체 이미지를 HSV로 변환
+        black_X_pixels_HSV = cv2.cvtColor(black_X_pixels.reshape(-1, 1, 3), cv2.COLOR_RGB2HSV).reshape(-1, 3)
+        
+        # H, S 채널 분리
+        H_channel = black_X_pixels_HSV[:, 0]  # H 채널
+        S_channel = black_X_pixels_HSV[:, 1]  # S 채널
+        
+        # H와 S 값의 평균 계산
+        H_mean = np.mean(H_channel)
+        S_mean = np.mean(S_channel)
+        
+        if H_mean < 94 and S_mean > 167 :
+            HSV_result = "good"
+        else :
+            HSV_result = "bad"
+        
+        # 결과 출력
+        print("H값 평균 :", H_mean)
+        print("S값 평균 :", S_mean)
+        
+        print("품질(조직감) 평가 :", HSV_result)
+        
+        # 이미지에 텍스트 추가
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        
+        text1 = f"intramuscular_fat: {intramuscular_fat}"
+        text2 = f"meat_result: {meat_result}"
+        text3 = f"fat_result: {fat_result}"
+        text4 = f"HSV_result: {HSV_result}"
+
+        position = (30, 30)  # 첫 번째 텍스트 위치
+        color = (0, 255, 0)  # 텍스트 색 (초록색)
+        thickness = 2  # 텍스트 두께
+        
+        # 첫 번째 텍스트
+        cv2.putText(image, text1, position, font, 1, color, thickness)
+        
+        # 두 번째 텍스트는 첫 번째 텍스트 밑으로 배치 (y 위치 증가)
+        position = (30, 70)  # 두 번째 텍스트 위치
+        cv2.putText(image, text2, position, font, 1, color, thickness)
+        
+        # 세 번째 텍스트는 두 번째 텍스트 밑으로 배치
+        position = (30, 110)  # 세 번째 텍스트 위치
+        cv2.putText(image, text3, position, font, 1, color, thickness)
+        
+        # 네 번째 텍스트는 세 번째 텍스트 밑으로 배치
+        position = (30, 150)  # 네 번째 텍스트 위치
+        cv2.putText(image, text4, position, font, 1, color, thickness)
+        
+        # 처리된 이미지를 저장할 경로 설정
+        output_path = os.path.join(output_folder, f"processed_{image_file}")
+        
+        # 이미지 저장
+        cv2.imwrite(output_path, image)
+        print(f"Processed {image_file} and saved as {output_path}")
+
+'''
+cv2.imshow('전처리 완료된 이미지', image_adjusted_BGR)
+cv2.imshow('배경 제거', background_0)
+cv2.imshow('이진화된 이미지', binary)
+cv2.imshow('클러스터 결과', clustered_image)
+cv2.imshow('ROI', ROI_img)
+
+cv2.waitKey(0)
+cv2.destroyAllWindows()
+'''
